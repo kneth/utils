@@ -1,0 +1,748 @@
+#!/usr/bin/env -S uv run --script --python >=3.11,<3.14
+# /// script
+# requires-python = ">=3.11,<3.14"
+# dependencies = ["imapclient>=3.0"]
+# ///
+"""proton2gmail - migrate Proton Mail to Gmail over IMAP without duplicates.
+
+Reads every folder from Proton Mail through the local Proton Bridge and copies the
+messages into Gmail. Proton folders/labels become Gmail labels (reused when a label of
+the same name exists, created otherwise). A message that already exists anywhere in
+Gmail is never copied again; if it lacks the label matching its Proton folder, the label
+is added instead. Progress is recorded in a state file so an interrupted or throttled run
+can be resumed by simply running the script again.
+
+Credentials and connection details come from the environment:
+
+  PROTON_IMAP_HOST      Bridge host                 (default 127.0.0.1)
+  PROTON_IMAP_PORT      Bridge IMAP port            (default 1143)
+  PROTON_IMAP_USER      Proton address              (required)
+  PROTON_IMAP_PASS      Bridge password             (required)
+  PROTON_IMAP_SECURITY  auto | ssl | starttls | none (default auto: try TLS, then STARTTLS)
+  PROTON_IMAP_NOVERIFY  1 = accept Bridge's self-signed cert (default 1)
+  GMAIL_IMAP_USER       Gmail address               (required)
+  GMAIL_IMAP_PASS       Gmail app password          (required)
+
+Exit status: 0 ok, 1 usage/config error, 2 connection failure, 3 Gmail throttled
+(re-run later, the state file makes it resume).
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import email.policy
+import email.utils
+import json
+import logging
+import os
+import re
+import ssl
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.parser import BytesHeaderParser
+from pathlib import Path
+
+from imapclient import IMAPClient
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
+from imapclient.imap_utf7 import decode as utf7_decode
+
+GMAIL_HOST = "imap.gmail.com"
+GMAIL_PORT = 993
+DEFAULT_APPEND_LIMIT = 35651584  # Gmail advertises APPENDLIMIT; this is its current value
+HEADER_ITEM = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM SUBJECT)]"
+CHUNK = 2000
+SOCKET_TIMEOUT = 120  # seconds; turns a silent hang into an error
+FLUSH_EVERY = 50
+KEEP_FLAGS = {b"\\Seen", b"\\Flagged", b"\\Answered", b"\\Draft"}
+THROTTLE_MARKERS = ("THROTTLED", "OVERQUOTA", "QUOTA", "TOO MANY", "SYSTEM ERROR")
+
+# Proton Bridge folder names when the Bridge does not send SPECIAL-USE attributes.
+PROTON_NAME_KIND = {
+    "sent": b"\\Sent",
+    "drafts": b"\\Drafts",
+    "archive": b"\\Archive",
+    "starred": b"\\Flagged",
+    "spam": b"\\Junk",
+    "trash": b"\\Trash",
+    "all mail": b"\\All",
+}
+BRIDGE_PREFIXES = {"folders", "labels"}
+
+# Gmail system label tokens as they appear in X-GM-LABELS.
+GMAIL_LABEL_TOKEN = {
+    b"INBOX": "\\Inbox",
+    b"\\Sent": "\\Sent",
+    b"\\Drafts": "\\Draft",
+    b"\\Trash": "\\Trash",
+    b"\\Junk": "\\Spam",
+}
+
+log = logging.getLogger("proton2gmail")
+
+
+class Throttled(Exception):
+    """Gmail refused further traffic for now."""
+
+
+class Fatal(Exception):
+    """Unrecoverable problem; message is user-facing."""
+
+
+# --------------------------------------------------------------------------- config
+
+
+@dataclass
+class Config:
+    proton_host: str
+    proton_port: int
+    proton_user: str
+    proton_pass: str
+    proton_security: str
+    proton_verify: bool
+    gmail_user: str
+    gmail_pass: str
+
+
+def load_config() -> Config:
+    def need(name: str) -> str:
+        value = os.environ.get(name)
+        if not value:
+            raise Fatal(f"environment variable {name} is required")
+        return value
+
+    security = os.environ.get("PROTON_IMAP_SECURITY", "auto").lower()
+    if security not in ("auto", "ssl", "starttls", "none"):
+        raise Fatal("PROTON_IMAP_SECURITY must be auto, ssl, starttls or none")
+    return Config(
+        proton_host=os.environ.get("PROTON_IMAP_HOST", "127.0.0.1"),
+        proton_port=int(os.environ.get("PROTON_IMAP_PORT", "1143")),
+        proton_user=need("PROTON_IMAP_USER"),
+        proton_pass=need("PROTON_IMAP_PASS"),
+        proton_security=security,
+        proton_verify=os.environ.get("PROTON_IMAP_NOVERIFY", "1") == "0",
+        gmail_user=need("GMAIL_IMAP_USER"),
+        gmail_pass=need("GMAIL_IMAP_PASS"),
+    )
+
+
+# ----------------------------------------------------------------------- connections
+
+
+def new_client(host: str, port: int, use_ssl: bool, ssl_context: ssl.SSLContext | None = None) -> IMAPClient:
+    client = IMAPClient(host, port, ssl=use_ssl, ssl_context=ssl_context, timeout=SOCKET_TIMEOUT)
+    # Keep INTERNALDATE timezone-aware instead of converting to naive local time.
+    # imapclient 3.x dropped the constructor argument but still honours the attribute.
+    client.normalise_times = False
+    return client
+
+
+def connect_proton(cfg: Config) -> IMAPClient:
+    ctx = ssl.create_default_context()
+    if not cfg.proton_verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    def tls() -> IMAPClient:
+        return new_client(cfg.proton_host, cfg.proton_port, use_ssl=True, ssl_context=ctx)
+
+    def plain(starttls: bool) -> IMAPClient:
+        client = new_client(cfg.proton_host, cfg.proton_port, use_ssl=False)
+        if starttls:
+            client.starttls(ctx)
+        return client
+
+    security = cfg.proton_security
+    if security == "ssl":
+        client = tls()
+    elif security == "starttls":
+        client = plain(True)
+    elif security == "none":
+        client = plain(False)
+    else:
+        # Proton Bridge serves implicit TLS or STARTTLS depending on its settings. A plain
+        # greeting read against a TLS-only port hangs, so try TLS first.
+        try:
+            client = tls()
+            security = "ssl"
+        except (ssl.SSLError, OSError, IMAPClientError) as exc:
+            log.debug("implicit TLS to Bridge failed (%s); trying STARTTLS", exc)
+            client = plain(True)
+            security = "starttls"
+    log.debug("Bridge connection uses %s", security)
+    client.login(cfg.proton_user, cfg.proton_pass)
+    return client
+
+
+def connect_gmail(cfg: Config) -> IMAPClient:
+    client = new_client(GMAIL_HOST, GMAIL_PORT, use_ssl=True)
+    client.login(cfg.gmail_user, cfg.gmail_pass)
+    return client
+
+
+def append_limit(client: IMAPClient) -> int:
+    for cap in client.capabilities():
+        if cap.upper().startswith(b"APPENDLIMIT="):
+            return int(cap.split(b"=", 1)[1])
+    return DEFAULT_APPEND_LIMIT
+
+
+def decode_delim(delim) -> str:
+    return (delim.decode() if isinstance(delim, bytes) else delim) or "/"
+
+
+GMAIL_SPECIAL = (b"\\All", b"\\Sent", b"\\Drafts", b"\\Trash", b"\\Junk", b"\\Flagged", b"\\Important")
+
+
+@dataclass
+class Folders:
+    """Gmail's folder list. System folder names are localised and can change between
+    (or even during) sessions, so they are resolved by SPECIAL-USE attribute."""
+
+    special: dict[bytes, str]
+    labels: dict[str, str]  # lower-case name -> real name
+    delim: str
+
+
+def list_gmail_folders(client: IMAPClient) -> Folders:
+    special: dict[bytes, str] = {}
+    labels: dict[str, str] = {}
+    delim = "/"
+    for flags, d, name in client.list_folders():
+        delim = decode_delim(d)
+        kind = next((f for f in flags if f in GMAIL_SPECIAL), None)
+        if kind:
+            special.setdefault(kind, name)
+        elif b"\\Noselect" not in flags and not name.startswith("[Gmail]") and name.upper() != "INBOX":
+            labels[name.lower()] = name
+    if b"\\All" not in special:
+        raise Fatal("could not find Gmail's All Mail folder (is IMAP enabled and All Mail shown in IMAP?)")
+    return Folders(special, labels, delim)
+
+
+class Session:
+    """Holds both connections and knows how to re-establish them mid-run."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.proton = connect_proton(cfg)
+        self.gmail = connect_gmail(cfg)
+        self.max_size = append_limit(self.gmail)
+        self.folders = list_gmail_folders(self.gmail)
+        self.proton_folder: str | None = None
+        self.gmail_kind: bytes | None = None  # currently selected Gmail system folder
+
+    def refresh_folders(self) -> None:
+        self.folders = list_gmail_folders(self.gmail)
+
+    def select_proton(self, folder: str) -> dict:
+        self.proton_folder = folder
+        return self.proton.select_folder(folder, readonly=True)
+
+    def resolve(self, target: Target) -> str:
+        """Current Gmail name for a target; system folders are looked up at call time."""
+        if target.kind is None:
+            return target.folder
+        name = self.folders.special.get(target.kind)
+        if not name:
+            raise Fatal(f"Gmail has no {target.kind.decode()} folder any more")
+        return name
+
+    def gmail_call(self, method: str, target: Target, *args):
+        """Like call(), with the target's name resolved now; on NONEXISTENT re-list and retry once."""
+        for attempt in (1, 2):
+            name = self.resolve(target)
+            try:
+                return self.call("gmail", method, name, *args)
+            except IMAPClientError as exc:
+                if attempt == 2 or "NONEXISTENT" not in str(exc).upper():
+                    raise
+                log.warning("Gmail folder %r vanished (%s); re-reading the folder list", name, exc)
+                self.refresh_folders()
+        return None  # unreachable
+
+    def select_gmail(self, kind: bytes) -> dict:
+        self.gmail_kind = kind
+        return self.gmail_call("select_folder", Target(kind, ""))
+
+    def add_labels(self, uid: int, label: str) -> None:
+        """Label a message in the selected system folder; re-select and retry once if Gmail
+        dropped the selection (it does so when a system folder is renamed under us)."""
+        try:
+            self.call("gmail", "add_gmail_labels", [uid], [label])
+        except IMAPClientError as exc:
+            if self.gmail_kind is None:
+                raise
+            log.warning("labelling failed (%s); re-selecting %s and retrying", exc, self.gmail_kind.decode())
+            self.select_gmail(self.gmail_kind)
+            self.call("gmail", "add_gmail_labels", [uid], [label])
+
+    def reconnect(self) -> None:
+        for client in (self.proton, self.gmail):
+            with contextlib.suppress(Exception):  # connection may already be broken
+                client.logout()
+        self.proton = connect_proton(self.cfg)
+        self.gmail = connect_gmail(self.cfg)
+        self.refresh_folders()
+        if self.proton_folder:
+            self.proton.select_folder(self.proton_folder, readonly=True)
+        if self.gmail_kind:
+            self.gmail.select_folder(self.resolve(Target(self.gmail_kind, "")))
+
+    def close(self) -> None:
+        for client in (self.proton, self.gmail):
+            with contextlib.suppress(Exception):  # connection may already be broken
+                client.logout()
+
+    def call(self, side: str, method: str, *args):
+        """Call self.<side>.<method>(*args); reconnect once on a dropped connection; detect throttling."""
+        for attempt in (1, 2):
+            try:
+                return getattr(getattr(self, side), method)(*args)
+            except (IMAPClientAbortError, OSError, ssl.SSLError) as exc:
+                if attempt == 2:
+                    raise Fatal(f"connection lost and reconnect failed: {exc}") from exc
+                log.warning("connection dropped (%s); reconnecting", exc)
+                time.sleep(5)
+                self.reconnect()
+            except IMAPClientError as exc:
+                text = str(exc).upper()
+                if any(marker in text for marker in THROTTLE_MARKERS):
+                    raise Throttled(str(exc)) from exc
+                raise
+        return None  # unreachable
+
+
+# --------------------------------------------------------------------- folder mapping
+
+
+@dataclass
+class Target:
+    kind: bytes | None  # SPECIAL-USE attribute of a system folder, resolved to a name at use time
+    folder: str  # label name, or the system folder name seen at mapping time (display only)
+    label: str | None = None  # X-GM-LABELS token a migrated message must carry (None: All Mail)
+    create: bool = False  # label does not exist in Gmail yet
+
+
+@dataclass
+class Mapping:
+    proton: str
+    target: Target | None  # None: skip this folder
+    note: str
+
+
+def proton_kind(flags: tuple[bytes, ...], name: str) -> bytes | None:
+    if name.upper() == "INBOX":
+        return b"INBOX"
+    for flag in flags:
+        if flag in (b"\\Sent", b"\\Drafts", b"\\Archive", b"\\Flagged", b"\\Junk", b"\\Trash", b"\\All"):
+            return flag
+    return PROTON_NAME_KIND.get(name.lower())
+
+
+def custom_label_name(name: str, proton_delim: str, gmail_delim: str) -> str:
+    parts = name.split(proton_delim) if proton_delim else [name]
+    if len(parts) > 1 and parts[0].lower() in BRIDGE_PREFIXES:
+        parts = parts[1:]
+    # Gmail rejects label names with leading, trailing or doubled whitespace
+    # ("[CANNOT] Folder contains excess whitespace"); Proton allows them.
+    parts = [re.sub(r"\s+", " ", part).strip() for part in parts]
+    return gmail_delim.join(part for part in parts if part)
+
+
+def map_folders(session: Session, args: argparse.Namespace) -> list[Mapping]:
+    folders = session.folders
+    mappings: list[Mapping] = []
+    wanted = {f.lower() for f in args.folder} if args.folder else None
+    for flags, delim, name in session.proton.list_folders():
+        if b"\\Noselect" in flags:
+            continue
+        if wanted is not None and name.lower() not in wanted:
+            continue
+        proton_delim = decode_delim(delim)
+        kind = proton_kind(flags, name)
+        if kind == b"INBOX":
+            mappings.append(Mapping(name, Target(None, "INBOX", "\\Inbox"), "inbox"))
+        elif kind in (b"\\All", b"\\Flagged"):
+            mappings.append(Mapping(name, None, "virtual folder, skipped"))
+        elif kind == b"\\Archive":
+            mappings.append(Mapping(name, Target(b"\\All", folders.special[b"\\All"]), "archive -> All Mail, no label"))
+        elif kind == b"\\Trash" and not args.include_trash:
+            mappings.append(Mapping(name, None, "skipped (use --include-trash)"))
+        elif kind == b"\\Junk" and not args.include_spam:
+            mappings.append(Mapping(name, None, "skipped (use --include-spam)"))
+        elif kind in (b"\\Sent", b"\\Drafts", b"\\Trash", b"\\Junk"):
+            folder = folders.special.get(kind)
+            if not folder:
+                mappings.append(Mapping(name, None, f"Gmail has no {kind.decode()} folder, skipped"))
+            else:
+                mappings.append(Mapping(name, Target(kind, folder, GMAIL_LABEL_TOKEN[kind]), "system folder"))
+        else:
+            label = custom_label_name(name, proton_delim, folders.delim)
+            existing = folders.labels.get(label.lower())
+            if existing:
+                mappings.append(Mapping(name, Target(None, existing, existing), "existing label"))
+            else:
+                mappings.append(Mapping(name, Target(None, label, label, create=True), "new label"))
+    if wanted is not None:
+        found = {m.proton.lower() for m in mappings}
+        for missing in wanted - found:
+            log.warning("Proton folder %r not found", missing)
+    return mappings
+
+
+def create_labels(session: Session, mappings: list[Mapping], dry_run: bool) -> None:
+    gmail_delim = session.folders.delim
+    created: set[str] = set()
+    for m in mappings:
+        if not m.target or not m.target.create:
+            continue
+        parts = m.target.folder.split(gmail_delim)
+        for i in range(1, len(parts) + 1):
+            path = gmail_delim.join(parts[:i])
+            if path in created:
+                continue
+            created.add(path)
+            if dry_run:
+                log.info("would create label %r", path)
+            elif not session.gmail.folder_exists(path):
+                log.info("creating label %r", path)
+                session.call("gmail", "create_folder", path)
+
+
+# ---------------------------------------------------------------------- message keys
+
+
+@dataclass
+class KeyInfo:
+    key: str
+    message_id: str | None = None
+    date: datetime | None = None
+    sender: str = ""
+    subject: str = ""
+
+
+_parser = BytesHeaderParser(policy=email.policy.default)
+
+
+def header_block(data: dict) -> bytes:
+    for k, v in data.items():
+        if isinstance(k, bytes) and k.startswith(b"BODY[HEADER"):
+            return v or b""
+    return b""
+
+
+def _header(msg, name: str) -> str:
+    try:
+        value = msg.get(name)
+        return str(value) if value is not None else ""
+    except Exception:  # noqa: BLE001 - malformed header
+        return ""
+
+
+def message_key(raw: bytes, internaldate: datetime | None) -> KeyInfo:
+    msg = _parser.parsebytes(raw)
+    mid = re.sub(r"\s+", "", _header(msg, "Message-ID")).strip("<>").lower()
+    if mid:
+        return KeyInfo(key="mid:" + mid, message_id=mid)
+    date = None
+    try:
+        date = email.utils.parsedate_to_datetime(_header(msg, "Date"))
+    except Exception:  # noqa: BLE001
+        date = None
+    if date is None:
+        date = internaldate
+    if date is not None and date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    epoch = int(date.timestamp()) if date else 0
+    sender = email.utils.parseaddr(_header(msg, "From"))[1].lower()
+    subject = re.sub(r"\s+", " ", _header(msg, "Subject")).strip()
+    return KeyInfo(key=f"hdr:{epoch}|{sender}|{subject}", date=date, sender=sender, subject=subject)
+
+
+def decode_labels(raw) -> set[str]:
+    labels = set()
+    for item in raw or ():
+        if isinstance(item, bytes):
+            labels.add(utf7_decode(item))
+        else:
+            labels.add(str(item))
+    return labels
+
+
+# ----------------------------------------------------------------------- gmail index
+
+
+@dataclass
+class Entry:
+    folder: str  # system folder kind ("\\All", "\\Trash", ...) the index saw the message in
+    uid: int | None  # UID within that folder; None for messages appended this run
+    labels: set[str] = field(default_factory=set)
+
+
+def chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def build_gmail_index(session: Session, kinds: list[bytes]) -> dict[str, Entry]:
+    index: dict[str, Entry] = {}
+    for kind in kinds:
+        session.select_gmail(kind)
+        folder = kind.decode()
+        uids = session.call("gmail", "search", "ALL")
+        log.info("indexing Gmail %s: %d messages", session.resolve(Target(kind, "")), len(uids))
+        done = 0
+        for chunk in chunks(uids, CHUNK):
+            resp = session.call("gmail", "fetch", chunk, [HEADER_ITEM, "INTERNALDATE", "X-GM-LABELS"])
+            for uid, data in resp.items():
+                info = message_key(header_block(data), data.get(b"INTERNALDATE"))
+                index.setdefault(info.key, Entry(folder, uid, decode_labels(data.get(b"X-GM-LABELS"))))
+            done += len(chunk)
+            log.debug("  indexed %d/%d", done, len(uids))
+    return index
+
+
+def find_allmail_uid(session: Session, info: KeyInfo) -> int | None:
+    """Locate a message in the selected All Mail folder when the index has no UID."""
+    try:
+        if info.message_id:
+            uids = session.call("gmail", "search", ["HEADER", "Message-ID", info.message_id])
+        elif info.date:
+            criteria = ["ON", info.date.date(), "SUBJECT", info.subject]
+            if info.sender:
+                criteria += ["FROM", info.sender]
+            uids = session.call("gmail", "search", criteria, "UTF-8")
+        else:
+            return None
+    except IMAPClientError as exc:
+        log.warning("search for %s failed: %s", info.key, exc)
+        return None
+    return max(uids) if uids else None
+
+
+# --------------------------------------------------------------------------- state
+
+
+class State:
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = {"proton_uidvalidity": {}, "done": {}}
+        self.done: dict[str, set[int]] = {}
+        self.dirty = 0
+        if path.exists():
+            with path.open() as fh:
+                self.data = json.load(fh)
+            self.done = {k: set(v) for k, v in self.data.get("done", {}).items()}
+
+    def check_uidvalidity(self, folder: str, uidvalidity: int) -> None:
+        stored = self.data["proton_uidvalidity"].get(folder)
+        if stored is not None and stored != uidvalidity:
+            log.warning("UIDVALIDITY changed for %s; dropping resume data for it", folder)
+            self.done.pop(folder, None)
+        self.data["proton_uidvalidity"][folder] = uidvalidity
+
+    def is_done(self, folder: str, uid: int) -> bool:
+        return uid in self.done.get(folder, ())
+
+    def mark(self, folder: str, uid: int) -> None:
+        self.done.setdefault(folder, set()).add(uid)
+        self.dirty += 1
+        if self.dirty >= FLUSH_EVERY:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.dirty:
+            return
+        self.data["done"] = {k: sorted(v) for k, v in self.done.items()}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        with tmp.open("w") as fh:
+            json.dump(self.data, fh)
+        tmp.replace(self.path)
+        self.dirty = 0
+
+
+# ------------------------------------------------------------------------- transfer
+
+
+def translate_flags(flags) -> tuple[str, ...]:
+    return tuple(f.decode() for f in flags or () if f in KEEP_FLAGS)
+
+
+def crlf(raw: bytes) -> bytes:
+    return raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+
+def migrate_folder(
+    session: Session,
+    m: Mapping,
+    index: dict[str, Entry],
+    state: State,
+    dry_run: bool,
+) -> Counter:
+    target = m.target
+    assert target is not None
+    counts: Counter = Counter()
+    selected = session.select_proton(m.proton)
+    state.check_uidvalidity(m.proton, int(selected[b"UIDVALIDITY"]))
+    uids = session.call("proton", "search", "ALL")
+    todo = [u for u in uids if not state.is_done(m.proton, u)]
+    counts["resumed"] = len(uids) - len(todo)
+    log.info("%s -> %s: %d messages, %d to check", m.proton, session.resolve(target), len(uids), len(todo))
+    if not dry_run:
+        session.select_gmail(b"\\All")
+
+    for chunk in chunks(todo, CHUNK):
+        resp = session.call("proton", "fetch", chunk, ["FLAGS", "INTERNALDATE", "RFC822.SIZE", HEADER_ITEM])
+        for uid in chunk:
+            data = resp.get(uid)
+            if not data:
+                counts["vanished"] += 1
+                continue
+            info = message_key(header_block(data), data.get(b"INTERNALDATE"))
+            entry = index.get(info.key)
+            if entry is not None:
+                needs_label = target.label is not None and target.label not in entry.labels
+                if not needs_label:
+                    counts["present"] += 1
+                elif entry.folder != "\\All":
+                    counts["present"] += 1
+                    log.debug("uid %d present in Gmail %s, not relabelled", uid, entry.folder)
+                elif dry_run:
+                    counts["labelled"] += 1
+                    entry.labels.add(target.label)
+                else:
+                    if entry.uid is None:
+                        entry.uid = find_allmail_uid(session, info)
+                    if entry.uid is None:
+                        counts["unlabelled"] += 1
+                        log.warning("uid %d: exists in Gmail but could not be located to add label %r", uid, target.label)
+                    else:
+                        session.add_labels(entry.uid, target.label)
+                        entry.labels.add(target.label)
+                        counts["labelled"] += 1
+                        log.debug("uid %d labelled %r", uid, target.label)
+            else:
+                size = int(data.get(b"RFC822.SIZE", 0))
+                if size > session.max_size:
+                    counts["too_large"] += 1
+                    log.warning("uid %d skipped: %d bytes exceeds Gmail's %d byte limit (%s)", uid, size, session.max_size, info.subject or info.key)
+                    continue
+                if not dry_run:
+                    body = session.call("proton", "fetch", [uid], ["BODY.PEEK[]"])[uid][b"BODY[]"]
+                    session.gmail_call(
+                        "append",
+                        target,
+                        crlf(body),
+                        translate_flags(data.get(b"FLAGS")),
+                        data.get(b"INTERNALDATE"),
+                    )
+                    log.debug("uid %d appended to %s (%s)", uid, session.resolve(target), info.subject or info.key)
+                labels = {target.label} if target.label else set()
+                index[info.key] = Entry("\\All", None, labels)
+                counts["appended"] += 1
+            if not dry_run:
+                state.mark(m.proton, uid)
+    return counts
+
+
+def report(m: Mapping, counts: Counter, dry_run: bool) -> None:
+    verb = "would append" if dry_run else "appended"
+    label_verb = "would label" if dry_run else "labelled"
+    parts = [
+        f"{counts['appended']} {verb}",
+        f"{counts['labelled']} {label_verb}",
+        f"{counts['present']} already present",
+    ]
+    for key, text in (("resumed", "done earlier"), ("too_large", "too large"), ("unlabelled", "not located"), ("vanished", "vanished")):
+        if counts[key]:
+            parts.append(f"{counts[key]} {text}")
+    print(f"{m.proton} -> {m.target.folder if m.target else '-'}: " + ", ".join(parts))
+
+
+# ----------------------------------------------------------------------------- main
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="proton2gmail",
+        description="Copy mail from Proton Mail (via Proton Bridge IMAP) into Gmail over IMAP, "
+        "mapping folders to labels and skipping messages Gmail already has.",
+        epilog=__doc__[__doc__.index("Credentials") :] if __doc__ else None,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--dry-run", action="store_true", help="show the folder mapping and counts, change nothing")
+    p.add_argument("--folder", action="append", default=[], metavar="NAME", help="only this Proton folder (repeatable)")
+    p.add_argument("--include-trash", action="store_true", help="also migrate Proton Trash into Gmail Trash")
+    p.add_argument("--include-spam", action="store_true", help="also migrate Proton Spam into Gmail Spam")
+    p.add_argument(
+        "--state",
+        type=Path,
+        default=Path.home() / ".cache" / "proton2gmail" / "state.json",
+        metavar="FILE",
+        help="resume state file (default: %(default)s)",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="log every message")
+    return p.parse_args(argv)
+
+
+def run(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    try:
+        session = Session(cfg)
+    except (IMAPClientError, OSError, ssl.SSLError) as exc:
+        raise Fatal(f"cannot connect: {exc}") from exc
+    state = State(args.state)
+    totals: Counter = Counter()
+    status = 0
+    try:
+        mappings = map_folders(session, args)
+        print("Folder mapping:")
+        for m in mappings:
+            dest = m.target.folder if m.target else "(skip)"
+            print(f"  {m.proton:40} -> {dest:40} {m.note}")
+        create_labels(session, mappings, args.dry_run)
+
+        # Trash and Spam are not part of All Mail, so index them too when they are targets.
+        index_kinds = [b"\\All"] + [m.target.kind for m in mappings if m.target and m.target.kind in (b"\\Trash", b"\\Junk")]
+        index = build_gmail_index(session, index_kinds)
+        log.info("Gmail index: %d distinct messages", len(index))
+
+        for m in mappings:
+            if not m.target:
+                continue
+            counts = migrate_folder(session, m, index, state, args.dry_run)
+            report(m, counts, args.dry_run)
+            totals.update(counts)
+    except Throttled as exc:
+        log.error("Gmail is throttling this account: %s", exc)
+        log.error("re-run later; progress has been saved to %s", args.state)
+        status = 3
+    except KeyboardInterrupt:
+        log.warning("interrupted; progress saved to %s", args.state)
+        status = 130
+    finally:
+        state.flush()
+        session.close()
+    verb = "would append" if args.dry_run else "appended"
+    print(f"Total: {totals['appended']} {verb}, {totals['labelled']} labelled, {totals['present']} already present")
+    return status
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    sys.stdout.reconfigure(line_buffering=True)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
+    log.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    try:
+        return run(args)
+    except Fatal as exc:
+        log.error("%s", exc)
+        return 2 if "connect" in str(exc) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

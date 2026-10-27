@@ -1,0 +1,710 @@
+#!/usr/bin/env -S uv run --script --python >=3.11,<3.14
+# /// script
+# requires-python = ">=3.11,<3.14"
+# dependencies = ["imapclient>=3.0"]
+# ///
+"""imap2icloud - migrate any IMAP account to iCloud Mail without duplicates.
+
+Reads every folder from a source IMAP account and copies the messages into iCloud Mail.
+Source folders become iCloud folders with the same nested names (reused when they exist,
+created otherwise); the source's hierarchy delimiter and personal namespace prefix (such
+as "INBOX.") are translated. System folders (Sent, Drafts, Archive, Junk, Trash) are
+found by their SPECIAL-USE attribute, falling back to common names, and land in iCloud's
+own. iCloud is a plain folder store, so each message is copied exactly once: a message
+that already exists in any iCloud folder is never copied again. A virtual "All Mail"
+folder (Gmail) is processed last into iCloud Archive and only receives messages found in
+no other folder, such as archived Gmail mail. Progress is recorded in a state file so an
+interrupted or throttled run resumes when re-run.
+
+Credentials and connection details come from the environment:
+
+  SOURCE_IMAP_HOST      source server               (required)
+  SOURCE_IMAP_PORT      source port                 (default 993 for ssl, 143 otherwise)
+  SOURCE_IMAP_USER      source login                (required)
+  SOURCE_IMAP_PASS      source password             (required)
+  SOURCE_IMAP_SECURITY  ssl | starttls | none       (default ssl)
+  SOURCE_IMAP_NOVERIFY  1 = do not verify the source's certificate (default 0)
+  ICLOUD_IMAP_USER      Apple ID address            (required)
+  ICLOUD_IMAP_PASS      app-specific password       (required, made at appleid.apple.com)
+
+Exit status: 0 ok, 1 usage/config error, 2 connection failure, 3 throttled
+(re-run later, the state file makes it resume).
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import email.policy
+import email.utils
+import json
+import logging
+import os
+import re
+import ssl
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.parser import BytesHeaderParser
+from pathlib import Path
+
+from imapclient import IMAPClient
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
+
+ICLOUD_HOST = "imap.mail.me.com"
+ICLOUD_PORT = 993
+HEADER_ITEM = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM SUBJECT)]"
+CHUNK = 2000
+SOCKET_TIMEOUT = 120  # seconds; turns a silent hang into an error
+FLUSH_EVERY = 50
+KEEP_FLAGS = {b"\\Seen", b"\\Flagged", b"\\Answered", b"\\Draft"}
+THROTTLE_MARKERS = ("THROTTLED", "OVERQUOTA", "QUOTA", "TOO MANY", "RATE LIMIT", "SYSTEM ERROR", "TRY AGAIN")
+
+SPECIAL_KINDS = (b"\\Sent", b"\\Drafts", b"\\Archive", b"\\Flagged", b"\\Junk", b"\\Trash", b"\\All", b"\\Important")
+
+# Common system folder names on servers that do not send SPECIAL-USE attributes
+# (Dovecot, Courier, Exchange, Cyrus, Fastmail, Gmail, ...). Matched without the
+# namespace prefix, case-insensitively.
+SOURCE_NAME_KIND = {
+    "sent": b"\\Sent",
+    "sent items": b"\\Sent",
+    "sent messages": b"\\Sent",
+    "sent mail": b"\\Sent",
+    "[gmail]/sent mail": b"\\Sent",
+    "drafts": b"\\Drafts",
+    "draft": b"\\Drafts",
+    "[gmail]/drafts": b"\\Drafts",
+    "archive": b"\\Archive",
+    "archives": b"\\Archive",
+    "junk": b"\\Junk",
+    "junk e-mail": b"\\Junk",
+    "junk email": b"\\Junk",
+    "spam": b"\\Junk",
+    "[gmail]/spam": b"\\Junk",
+    "trash": b"\\Trash",
+    "deleted": b"\\Trash",
+    "deleted items": b"\\Trash",
+    "deleted messages": b"\\Trash",
+    "[gmail]/trash": b"\\Trash",
+    "[gmail]/bin": b"\\Trash",
+    "starred": b"\\Flagged",
+    "[gmail]/starred": b"\\Flagged",
+    "[gmail]/important": b"\\Important",
+    "all mail": b"\\All",
+    "[gmail]/all mail": b"\\All",
+}
+
+# iCloud's fixed system folder names, used when it does not send SPECIAL-USE attributes.
+ICLOUD_NAME_KIND = {
+    "sent messages": b"\\Sent",
+    "drafts": b"\\Drafts",
+    "archive": b"\\Archive",
+    "junk": b"\\Junk",
+    "deleted messages": b"\\Trash",
+}
+
+log = logging.getLogger("imap2icloud")
+
+
+class Throttled(Exception):
+    """A server refused further traffic for now."""
+
+
+class Fatal(Exception):
+    """Unrecoverable problem; message is user-facing."""
+
+
+# --------------------------------------------------------------------------- config
+
+
+@dataclass
+class Config:
+    source_host: str
+    source_port: int
+    source_user: str
+    source_pass: str
+    source_security: str
+    source_verify: bool
+    icloud_user: str
+    icloud_pass: str
+
+
+def load_config() -> Config:
+    def need(name: str) -> str:
+        value = os.environ.get(name)
+        if not value:
+            raise Fatal(f"environment variable {name} is required")
+        return value
+
+    security = os.environ.get("SOURCE_IMAP_SECURITY", "ssl").lower()
+    if security not in ("ssl", "starttls", "none"):
+        raise Fatal("SOURCE_IMAP_SECURITY must be ssl, starttls or none")
+    return Config(
+        source_host=need("SOURCE_IMAP_HOST"),
+        source_port=int(os.environ.get("SOURCE_IMAP_PORT", "993" if security == "ssl" else "143")),
+        source_user=need("SOURCE_IMAP_USER"),
+        source_pass=need("SOURCE_IMAP_PASS"),
+        source_security=security,
+        source_verify=os.environ.get("SOURCE_IMAP_NOVERIFY", "0") != "1",
+        icloud_user=need("ICLOUD_IMAP_USER"),
+        icloud_pass=need("ICLOUD_IMAP_PASS"),
+    )
+
+
+# ----------------------------------------------------------------------- connections
+
+
+def new_client(host: str, port: int, use_ssl: bool, ssl_context: ssl.SSLContext | None = None) -> IMAPClient:
+    client = IMAPClient(host, port, ssl=use_ssl, ssl_context=ssl_context, timeout=SOCKET_TIMEOUT)
+    # Keep INTERNALDATE timezone-aware instead of converting to naive local time.
+    client.normalise_times = False
+    return client
+
+
+def ssl_context(verify: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def connect_source(cfg: Config) -> IMAPClient:
+    ctx = ssl_context(cfg.source_verify)
+    if cfg.source_security == "ssl":
+        client = new_client(cfg.source_host, cfg.source_port, use_ssl=True, ssl_context=ctx)
+    else:
+        client = new_client(cfg.source_host, cfg.source_port, use_ssl=False)
+        if cfg.source_security == "starttls":
+            client.starttls(ctx)
+    client.login(cfg.source_user, cfg.source_pass)
+    return client
+
+
+def connect_icloud(cfg: Config) -> IMAPClient:
+    client = new_client(ICLOUD_HOST, ICLOUD_PORT, use_ssl=True)
+    client.login(cfg.icloud_user, cfg.icloud_pass)
+    return client
+
+
+def append_limit(client: IMAPClient) -> int:
+    """Largest message the server accepts, 0 when it does not say."""
+    for cap in client.capabilities():
+        if cap.upper().startswith(b"APPENDLIMIT="):
+            return int(cap.split(b"=", 1)[1])
+    return 0
+
+
+def decode_delim(delim) -> str:
+    return (delim.decode() if isinstance(delim, bytes) else delim) or "/"
+
+
+@dataclass
+class Folders:
+    """A server's folder list, resolved by SPECIAL-USE attribute and by name."""
+
+    special: dict[bytes, str]
+    by_lower: dict[str, str]  # lower-case name -> real name, every selectable folder
+    delim: str
+    prefix: str  # personal namespace prefix, "" or e.g. "INBOX."
+
+    def bare(self, name: str) -> str:
+        """Folder name without the personal namespace prefix."""
+        return name[len(self.prefix) :] if self.prefix and name.startswith(self.prefix) else name
+
+
+def personal_prefix(client: IMAPClient, delim: str, names: list[str]) -> str:
+    if client.has_capability("NAMESPACE"):
+        with contextlib.suppress(Exception):  # some servers advertise it and then fail
+            personal = client.namespace().personal
+            if personal and personal[0][0]:
+                return personal[0][0]
+    # No usable NAMESPACE: infer an "INBOX." style prefix from the existing folders.
+    others = [n for n in names if n.upper() != "INBOX"]
+    if others and all(n.upper().startswith("INBOX" + delim) for n in others):
+        return others[0][: len("INBOX") + len(delim)]
+    return ""
+
+
+def list_server_folders(client: IMAPClient, name_kind: dict[str, bytes]) -> tuple[Folders, list[tuple]]:
+    """The server's Folders plus its raw listing."""
+    special: dict[bytes, str] = {}
+    by_lower: dict[str, str] = {}
+    delim = "/"
+    listing = client.list_folders()
+    for _flags, d, _name in listing:
+        delim = decode_delim(d)
+    folders = Folders(special, by_lower, delim, personal_prefix(client, delim, [n for _f, _d, n in listing]))
+    for flags, _d, name in listing:
+        if b"\\Noselect" in flags or b"\\NonExistent" in flags:
+            continue
+        by_lower[name.lower()] = name
+        kind = next((f for f in flags if f in SPECIAL_KINDS), None) or name_kind.get(folders.bare(name).lower())
+        if kind:
+            special.setdefault(kind, name)
+    return folders, listing
+
+
+def list_icloud_folders(client: IMAPClient) -> Folders:
+    return list_server_folders(client, ICLOUD_NAME_KIND)[0]
+
+
+class Session:
+    """Holds both connections and knows how to re-establish them mid-run."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.source = connect_source(cfg)
+        self.icloud = connect_icloud(cfg)
+        self.max_size = append_limit(self.icloud)
+        self.folders = list_icloud_folders(self.icloud)
+        self.source_folder: str | None = None
+        self.icloud_folder: str | None = None
+
+    def select_source(self, folder: str) -> dict:
+        self.source_folder = folder
+        return self.source.select_folder(folder, readonly=True)
+
+    def select_icloud(self, folder: str) -> dict:
+        self.icloud_folder = folder
+        return self.icloud.select_folder(folder, readonly=True)
+
+    def reconnect(self) -> None:
+        for client in (self.source, self.icloud):
+            with contextlib.suppress(Exception):  # connection may already be broken
+                client.logout()
+        self.source = connect_source(self.cfg)
+        self.icloud = connect_icloud(self.cfg)
+        # System folder names can change between sessions; resolve them again.
+        self.folders = list_icloud_folders(self.icloud)
+        if self.source_folder:
+            self.source.select_folder(self.source_folder, readonly=True)
+        if self.icloud_folder:
+            self.icloud.select_folder(self.icloud_folder, readonly=True)
+
+    def close(self) -> None:
+        for client in (self.source, self.icloud):
+            with contextlib.suppress(Exception):  # connection may already be broken
+                client.logout()
+
+    def call(self, side: str, method: str, *args):
+        """Call self.<side>.<method>(*args); reconnect once on a dropped connection; detect throttling."""
+        for attempt in (1, 2):
+            try:
+                return getattr(getattr(self, side), method)(*args)
+            except (IMAPClientAbortError, OSError, ssl.SSLError) as exc:
+                if attempt == 2:
+                    raise Fatal(f"connection lost and reconnect failed: {exc}") from exc
+                log.warning("connection dropped (%s); reconnecting", exc)
+                time.sleep(5)
+                self.reconnect()
+            except IMAPClientError as exc:
+                text = str(exc).upper()
+                if any(marker in text for marker in THROTTLE_MARKERS):
+                    raise Throttled(f"{side}: {exc}") from exc
+                raise
+        return None  # unreachable
+
+
+# --------------------------------------------------------------------- folder mapping
+
+
+@dataclass
+class Target:
+    kind: bytes | None  # SPECIAL-USE kind, resolved to a name at use time; None for a custom folder
+    name: str  # custom folder name, or the system folder name seen at mapping time (display only)
+    create: bool = False  # custom folder does not exist in iCloud yet
+
+
+@dataclass
+class Mapping:
+    source: str
+    target: Target | None  # None: skip this folder
+    note: str
+    last: bool = False  # catch-all folder; processed after the others
+
+
+def target_folder(session: Session, target: Target) -> str:
+    if target.kind is None:
+        return target.name
+    name = session.folders.special.get(target.kind)
+    if not name:
+        raise Fatal(f"iCloud has no {target.kind.decode()} folder any more")
+    return name
+
+
+def custom_folder_name(name: str, source: Folders, icloud: Folders) -> str:
+    bare = source.bare(name)
+    parts = bare.split(source.delim) if source.delim else [bare]
+    # Servers reject names with leading, trailing or doubled whitespace; some sources allow them.
+    parts = [re.sub(r"\s+", " ", part).strip() for part in parts]
+    # A segment containing iCloud's own delimiter would be split into two levels.
+    return icloud.delim.join(part.replace(icloud.delim, "-") for part in parts if part)
+
+
+def map_folders(session: Session, args: argparse.Namespace) -> list[Mapping]:
+    folders = session.folders
+    source, listing = list_server_folders(session.source, SOURCE_NAME_KIND)
+    log.info("source %s: delimiter %r, namespace prefix %r", session.cfg.source_host, source.delim, source.prefix)
+    mappings: list[Mapping] = []
+    sources: dict[str, list[str]] = {}  # iCloud folder (lower-case) -> source folders mapped to it
+    wanted = {f.lower() for f in args.folder} if args.folder else None
+    kinds = {name: kind for kind, name in source.special.items()}
+    for flags, _delim, name in listing:
+        if b"\\Noselect" in flags or b"\\NonExistent" in flags:
+            continue
+        if wanted is not None and name.lower() not in wanted:
+            continue
+        kind = b"INBOX" if name.upper() == "INBOX" else kinds.get(name)
+        if kind == b"INBOX":
+            mappings.append(Mapping(name, Target(None, "INBOX"), "inbox"))
+        elif kind in (b"\\Flagged", b"\\Important"):
+            mappings.append(Mapping(name, None, "virtual folder, skipped"))
+        elif kind == b"\\All" and args.skip_all_mail:
+            mappings.append(Mapping(name, None, "all mail, skipped (--skip-all-mail)"))
+        elif kind == b"\\Trash" and not args.include_trash:
+            mappings.append(Mapping(name, None, "skipped (use --include-trash)"))
+        elif kind == b"\\Junk" and not args.include_spam:
+            mappings.append(Mapping(name, None, "skipped (use --include-spam)"))
+        elif kind in (b"\\Sent", b"\\Drafts", b"\\Archive", b"\\Trash", b"\\Junk", b"\\All"):
+            dest_kind = b"\\Archive" if kind == b"\\All" else kind
+            folder = folders.special.get(dest_kind)
+            last = kind == b"\\All"
+            if not folder:
+                mappings.append(Mapping(name, None, f"iCloud has no {dest_kind.decode()} folder, skipped"))
+            elif last:
+                mappings.append(Mapping(name, Target(dest_kind, folder), "all mail, last: only mail found nowhere else", last))
+            else:
+                mappings.append(Mapping(name, Target(dest_kind, folder), "system folder"))
+        else:
+            folder = custom_folder_name(name, source, folders)
+            if not folder:
+                mappings.append(Mapping(name, None, "empty name, skipped"))
+                continue
+            sources.setdefault(folder.lower(), []).append(name)
+            existing = folders.by_lower.get(folder.lower())
+            if existing:
+                mappings.append(Mapping(name, Target(None, existing), "existing folder"))
+            else:
+                mappings.append(Mapping(name, Target(None, folder, create=True), "new folder"))
+    if wanted is not None:
+        found = {m.source.lower() for m in mappings}
+        for missing in wanted - found:
+            log.warning("source folder %r not found", missing)
+    for names in sources.values():
+        if len(names) > 1:
+            log.warning("source folders %s map to the same iCloud folder; their mail will share it", ", ".join(map(repr, names)))
+    # All Mail holds every message; process it last so copies land in their real folders and
+    # it only catches messages found nowhere else (archived Gmail mail).
+    mappings.sort(key=lambda m: m.last)
+    return mappings
+
+
+def create_folders(session: Session, mappings: list[Mapping], dry_run: bool) -> None:
+    delim = session.folders.delim
+    created: set[str] = set()
+    for m in mappings:
+        if not m.target or not m.target.create:
+            continue
+        parts = m.target.name.split(delim)
+        for i in range(1, len(parts) + 1):
+            path = delim.join(parts[:i])
+            if path in created or path.lower() in session.folders.by_lower:
+                continue
+            created.add(path)
+            if dry_run:
+                log.info("would create folder %r", path)
+            else:
+                log.info("creating folder %r", path)
+                session.call("icloud", "create_folder", path)
+                session.folders.by_lower[path.lower()] = path
+
+
+# ---------------------------------------------------------------------- message keys
+
+
+@dataclass
+class KeyInfo:
+    key: str
+    subject: str = ""
+
+
+_parser = BytesHeaderParser(policy=email.policy.default)
+
+
+def header_block(data: dict) -> bytes:
+    for k, v in data.items():
+        if isinstance(k, bytes) and k.startswith(b"BODY[HEADER"):
+            return v or b""
+    return b""
+
+
+def _header(msg, name: str) -> str:
+    try:
+        value = msg.get(name)
+        return str(value) if value is not None else ""
+    except Exception:  # noqa: BLE001 - malformed header
+        return ""
+
+
+def message_key(raw: bytes, internaldate: datetime | None) -> KeyInfo:
+    msg = _parser.parsebytes(raw)
+    subject = re.sub(r"\s+", " ", _header(msg, "Subject")).strip()
+    mid = re.sub(r"\s+", "", _header(msg, "Message-ID")).strip("<>").lower()
+    if mid:
+        return KeyInfo(key="mid:" + mid, subject=subject)
+    date = None
+    try:
+        date = email.utils.parsedate_to_datetime(_header(msg, "Date"))
+    except Exception:  # noqa: BLE001
+        date = None
+    if date is None:
+        date = internaldate
+    if date is not None and date.tzinfo is None:
+        date = date.replace(tzinfo=UTC)
+    epoch = int(date.timestamp()) if date else 0
+    sender = email.utils.parseaddr(_header(msg, "From"))[1].lower()
+    return KeyInfo(key=f"hdr:{epoch}|{sender}|{subject}", subject=subject)
+
+
+# ---------------------------------------------------------------------- icloud index
+
+
+def chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def build_icloud_index(session: Session) -> dict[str, str]:
+    """key -> iCloud folder holding the message, over every selectable folder."""
+    index: dict[str, str] = {}
+    for folder in sorted(session.folders.by_lower.values()):
+        session.select_icloud(folder)
+        uids = session.call("icloud", "search", "ALL")
+        log.info("indexing iCloud %s: %d messages", folder, len(uids))
+        done = 0
+        for chunk in chunks(uids, CHUNK):
+            resp = session.call("icloud", "fetch", chunk, [HEADER_ITEM, "INTERNALDATE"])
+            for data in resp.values():
+                info = message_key(header_block(data), data.get(b"INTERNALDATE"))
+                index.setdefault(info.key, folder)
+            done += len(chunk)
+            log.debug("  indexed %d/%d", done, len(uids))
+    return index
+
+
+# --------------------------------------------------------------------------- state
+
+
+class State:
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = {"source_uidvalidity": {}, "done": {}}
+        self.done: dict[str, set[int]] = {}
+        self.dirty = 0
+        if path.exists():
+            with path.open() as fh:
+                self.data = json.load(fh)
+            self.done = {k: set(v) for k, v in self.data.get("done", {}).items()}
+
+    def check_uidvalidity(self, folder: str, uidvalidity: int) -> None:
+        stored = self.data["source_uidvalidity"].get(folder)
+        if stored is not None and stored != uidvalidity:
+            log.warning("UIDVALIDITY changed for %s; dropping resume data for it", folder)
+            self.done.pop(folder, None)
+        self.data["source_uidvalidity"][folder] = uidvalidity
+
+    def is_done(self, folder: str, uid: int) -> bool:
+        return uid in self.done.get(folder, ())
+
+    def mark(self, folder: str, uid: int) -> None:
+        self.done.setdefault(folder, set()).add(uid)
+        self.dirty += 1
+        if self.dirty >= FLUSH_EVERY:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.dirty:
+            return
+        self.data["done"] = {k: sorted(v) for k, v in self.done.items()}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        with tmp.open("w") as fh:
+            json.dump(self.data, fh)
+        tmp.replace(self.path)
+        self.dirty = 0
+
+
+def default_state_path(cfg: Config) -> Path:
+    # One file per source account, so migrating several accounts never mixes resume data.
+    account = re.sub(r"[^\w.@-]", "_", f"{cfg.source_user}@{cfg.source_host}")
+    return Path.home() / ".cache" / "imap2icloud" / f"{account}.json"
+
+
+# ------------------------------------------------------------------------- transfer
+
+
+def translate_flags(flags) -> tuple[str, ...]:
+    return tuple(f.decode() for f in flags or () if f in KEEP_FLAGS)
+
+
+def crlf(raw: bytes) -> bytes:
+    return raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+
+def migrate_folder(session: Session, m: Mapping, index: dict[str, str], state: State, dry_run: bool) -> Counter:
+    target = m.target
+    assert target is not None
+    counts: Counter = Counter()
+    selected = session.select_source(m.source)
+    state.check_uidvalidity(m.source, int(selected[b"UIDVALIDITY"]))
+    uids = session.call("source", "search", "ALL")
+    todo = [u for u in uids if not state.is_done(m.source, u)]
+    counts["resumed"] = len(uids) - len(todo)
+    dest = target_folder(session, target)
+    log.info("%s -> %s: %d messages, %d to check", m.source, dest, len(uids), len(todo))
+
+    for chunk in chunks(todo, CHUNK):
+        resp = session.call("source", "fetch", chunk, ["FLAGS", "INTERNALDATE", "RFC822.SIZE", HEADER_ITEM])
+        for uid in chunk:
+            data = resp.get(uid)
+            if not data:
+                counts["vanished"] += 1
+                continue
+            info = message_key(header_block(data), data.get(b"INTERNALDATE"))
+            where = index.get(info.key)
+            if where is not None:
+                counts["present"] += 1
+                if where.lower() != dest.lower():
+                    counts["elsewhere"] += 1
+                    log.debug("uid %d already in iCloud %s, not copied to %s", uid, where, dest)
+            else:
+                size = int(data.get(b"RFC822.SIZE", 0))
+                if session.max_size and size > session.max_size:
+                    counts["too_large"] += 1
+                    log.warning("uid %d skipped: %d bytes exceeds iCloud's %d byte limit (%s)", uid, size, session.max_size, info.subject)
+                    continue
+                if not dry_run:
+                    body = session.call("source", "fetch", [uid], ["BODY.PEEK[]"])[uid][b"BODY[]"]
+                    dest = target_folder(session, target)  # may have changed after a reconnect
+                    try:
+                        session.call(
+                            "icloud",
+                            "append",
+                            dest,
+                            crlf(body),
+                            translate_flags(data.get(b"FLAGS")),
+                            data.get(b"INTERNALDATE"),
+                        )
+                    except IMAPClientError as exc:
+                        counts["failed"] += 1
+                        log.warning("uid %d not copied (%s): %s", uid, info.subject, exc)
+                        continue
+                    log.debug("uid %d appended to %s (%s)", uid, dest, info.subject or info.key)
+                index[info.key] = dest
+                counts["appended"] += 1
+            if not dry_run:
+                state.mark(m.source, uid)
+    return counts
+
+
+def report(m: Mapping, counts: Counter, dry_run: bool) -> None:
+    verb = "would append" if dry_run else "appended"
+    parts = [f"{counts['appended']} {verb}", f"{counts['present']} already present"]
+    for key, text in (
+        ("elsewhere", "of those in another folder"),
+        ("resumed", "done earlier"),
+        ("too_large", "too large"),
+        ("failed", "failed"),
+        ("vanished", "vanished"),
+    ):
+        if counts[key]:
+            parts.append(f"{counts[key]} {text}")
+    print(f"{m.source} -> {m.target.name if m.target else '-'}: " + ", ".join(parts))
+
+
+# ----------------------------------------------------------------------------- main
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="imap2icloud",
+        description="Copy mail from any IMAP account into iCloud Mail over IMAP, "
+        "mapping folders to folders and skipping messages iCloud already has.",
+        epilog=__doc__[__doc__.index("Credentials") :] if __doc__ else None,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--dry-run", action="store_true", help="show the folder mapping and counts, change nothing")
+    p.add_argument("--folder", action="append", default=[], metavar="NAME", help="only this source folder (repeatable)")
+    p.add_argument("--include-trash", action="store_true", help="also migrate the source Trash into iCloud Deleted Messages")
+    p.add_argument("--include-spam", action="store_true", help="also migrate the source Junk/Spam into iCloud Junk")
+    p.add_argument("--skip-all-mail", action="store_true", help="do not copy mail found only in an All Mail folder")
+    p.add_argument(
+        "--state",
+        type=Path,
+        metavar="FILE",
+        help="resume state file (default: ~/.cache/imap2icloud/USER@HOST.json for the source account)",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="log every message")
+    return p.parse_args(argv)
+
+
+def run(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if args.state is None:
+        args.state = default_state_path(cfg)
+    try:
+        session = Session(cfg)
+    except (IMAPClientError, OSError, ssl.SSLError) as exc:
+        raise Fatal(f"cannot connect: {exc}") from exc
+    state = State(args.state)
+    totals: Counter = Counter()
+    status = 0
+    try:
+        mappings = map_folders(session, args)
+        print("Folder mapping:")
+        for m in mappings:
+            dest = m.target.name if m.target else "(skip)"
+            print(f"  {m.source:40} -> {dest:40} {m.note}")
+        create_folders(session, mappings, args.dry_run)
+
+        index = build_icloud_index(session)
+        log.info("iCloud index: %d distinct messages", len(index))
+
+        for m in mappings:
+            if not m.target:
+                continue
+            counts = migrate_folder(session, m, index, state, args.dry_run)
+            report(m, counts, args.dry_run)
+            totals.update(counts)
+    except Throttled as exc:
+        log.error("throttled: %s", exc)
+        log.error("re-run later; progress has been saved to %s", args.state)
+        status = 3
+    except KeyboardInterrupt:
+        log.warning("interrupted; progress saved to %s", args.state)
+        status = 130
+    finally:
+        state.flush()
+        session.close()
+    verb = "would append" if args.dry_run else "appended"
+    print(f"Total: {totals['appended']} {verb}, {totals['present']} already present, {totals['failed']} failed")
+    return status
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    sys.stdout.reconfigure(line_buffering=True)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
+    log.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    try:
+        return run(args)
+    except Fatal as exc:
+        log.error("%s", exc)
+        return 2 if "connect" in str(exc) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,767 @@
+#!/usr/bin/env -S uv run --script --python >=3.11,<3.14
+# /// script
+# requires-python = ">=3.11,<3.14"
+# dependencies = ["imapclient>=3.0"]
+# ///
+"""proton2imap - migrate Proton Mail to any IMAP server without duplicates.
+
+Reads every folder from Proton Mail through the local Proton Bridge and copies the
+messages into a target IMAP account. Proton folders and labels become folders with the
+same nested names on the target (reused when they exist, created otherwise). A plain IMAP
+server has no labels, so each message is copied exactly once: a message that already
+exists in any target folder is never copied again, wherever Proton keeps it. Proton
+labels are therefore processed last and only receive messages that exist nowhere else.
+Progress is recorded in a state file so an interrupted or throttled run resumes when
+re-run.
+
+The target's system folders (Sent, Drafts, Archive, Trash, Junk) are found by their
+SPECIAL-USE attribute, falling back to common names; a missing one is created. The
+server's hierarchy delimiter and personal namespace prefix (such as "INBOX.") are
+honoured when naming folders.
+
+Many servers cannot store a "." in a folder name, so dots are rewritten: one before a
+space or at the end is dropped ("G. Blake" -> "G Blake"), any other becomes "_"
+("One.com" -> "One_com"). Use --keep-dots on a server known to accept them.
+
+Credentials and connection details come from the environment:
+
+  PROTON_IMAP_HOST      Bridge host                 (default 127.0.0.1)
+  PROTON_IMAP_PORT      Bridge IMAP port            (default 1143)
+  PROTON_IMAP_USER      Proton address              (required)
+  PROTON_IMAP_PASS      Bridge password             (required)
+  PROTON_IMAP_SECURITY  auto | ssl | starttls | none (default auto: try TLS, then STARTTLS)
+  PROTON_IMAP_NOVERIFY  1 = accept Bridge's self-signed cert (default 1)
+  IMAP_HOST             target server               (required)
+  IMAP_PORT             target port                 (default 993 for ssl, 143 otherwise)
+  IMAP_USER             target login                (required)
+  IMAP_PASS             target password             (required)
+  IMAP_SECURITY         ssl | starttls | none       (default ssl)
+  IMAP_NOVERIFY         1 = do not verify the target's certificate (default 0)
+
+Exit status: 0 ok, 1 usage/config error, 2 connection failure, 3 target throttled
+(re-run later, the state file makes it resume).
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import email.policy
+import email.utils
+import json
+import logging
+import os
+import re
+import ssl
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.parser import BytesHeaderParser
+from pathlib import Path
+
+from imapclient import IMAPClient
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
+
+HEADER_ITEM = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM SUBJECT)]"
+CHUNK = 2000
+SOCKET_TIMEOUT = 120  # seconds; turns a silent hang into an error
+FLUSH_EVERY = 50
+KEEP_FLAGS = {b"\\Seen", b"\\Flagged", b"\\Answered", b"\\Draft"}
+THROTTLE_MARKERS = ("THROTTLED", "OVERQUOTA", "QUOTA", "TOO MANY", "RATE LIMIT", "SYSTEM ERROR", "TRY AGAIN")
+
+SPECIAL_KINDS = (b"\\Sent", b"\\Drafts", b"\\Archive", b"\\Flagged", b"\\Junk", b"\\Trash", b"\\All")
+
+# Proton Bridge folder names when the Bridge does not send SPECIAL-USE attributes.
+PROTON_NAME_KIND = {
+    "sent": b"\\Sent",
+    "drafts": b"\\Drafts",
+    "archive": b"\\Archive",
+    "starred": b"\\Flagged",
+    "spam": b"\\Junk",
+    "trash": b"\\Trash",
+    "all mail": b"\\All",
+}
+BRIDGE_PREFIXES = {"folders", "labels"}
+
+# Common system folder names on servers that do not send SPECIAL-USE attributes
+# (Dovecot, Courier, Exchange, Cyrus, iCloud, Fastmail, ...). Matched without the
+# namespace prefix, case-insensitively.
+TARGET_NAME_KIND = {
+    "sent": b"\\Sent",
+    "sent items": b"\\Sent",
+    "sent messages": b"\\Sent",
+    "sent mail": b"\\Sent",
+    "drafts": b"\\Drafts",
+    "draft": b"\\Drafts",
+    "archive": b"\\Archive",
+    "archives": b"\\Archive",
+    "junk": b"\\Junk",
+    "junk e-mail": b"\\Junk",
+    "junk email": b"\\Junk",
+    "spam": b"\\Junk",
+    "trash": b"\\Trash",
+    "deleted": b"\\Trash",
+    "deleted items": b"\\Trash",
+    "deleted messages": b"\\Trash",
+}
+# Name used when the target lacks a system folder and one has to be created.
+DEFAULT_SYSTEM_NAME = {b"\\Sent": "Sent", b"\\Drafts": "Drafts", b"\\Archive": "Archive", b"\\Junk": "Junk", b"\\Trash": "Trash"}
+
+log = logging.getLogger("proton2imap")
+
+
+class Throttled(Exception):
+    """The target refused further traffic for now."""
+
+
+class Fatal(Exception):
+    """Unrecoverable problem; message is user-facing."""
+
+
+# --------------------------------------------------------------------------- config
+
+
+@dataclass
+class Config:
+    proton_host: str
+    proton_port: int
+    proton_user: str
+    proton_pass: str
+    proton_security: str
+    proton_verify: bool
+    host: str
+    port: int
+    user: str
+    password: str
+    security: str
+    verify: bool
+
+
+def load_config() -> Config:
+    def need(name: str) -> str:
+        value = os.environ.get(name)
+        if not value:
+            raise Fatal(f"environment variable {name} is required")
+        return value
+
+    proton_security = os.environ.get("PROTON_IMAP_SECURITY", "auto").lower()
+    if proton_security not in ("auto", "ssl", "starttls", "none"):
+        raise Fatal("PROTON_IMAP_SECURITY must be auto, ssl, starttls or none")
+    security = os.environ.get("IMAP_SECURITY", "ssl").lower()
+    if security not in ("ssl", "starttls", "none"):
+        raise Fatal("IMAP_SECURITY must be ssl, starttls or none")
+    return Config(
+        proton_host=os.environ.get("PROTON_IMAP_HOST", "127.0.0.1"),
+        proton_port=int(os.environ.get("PROTON_IMAP_PORT", "1143")),
+        proton_user=need("PROTON_IMAP_USER"),
+        proton_pass=need("PROTON_IMAP_PASS"),
+        proton_security=proton_security,
+        proton_verify=os.environ.get("PROTON_IMAP_NOVERIFY", "1") == "0",
+        host=need("IMAP_HOST"),
+        port=int(os.environ.get("IMAP_PORT", "993" if security == "ssl" else "143")),
+        user=need("IMAP_USER"),
+        password=need("IMAP_PASS"),
+        security=security,
+        verify=os.environ.get("IMAP_NOVERIFY", "0") != "1",
+    )
+
+
+# ----------------------------------------------------------------------- connections
+
+
+def new_client(host: str, port: int, use_ssl: bool, ssl_context: ssl.SSLContext | None = None) -> IMAPClient:
+    client = IMAPClient(host, port, ssl=use_ssl, ssl_context=ssl_context, timeout=SOCKET_TIMEOUT)
+    # Keep INTERNALDATE timezone-aware instead of converting to naive local time.
+    client.normalise_times = False
+    return client
+
+
+def ssl_context(verify: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def open_connection(host: str, port: int, security: str, ctx: ssl.SSLContext) -> IMAPClient:
+    if security == "ssl":
+        return new_client(host, port, use_ssl=True, ssl_context=ctx)
+    client = new_client(host, port, use_ssl=False)
+    if security == "starttls":
+        client.starttls(ctx)
+    return client
+
+
+def connect_proton(cfg: Config) -> IMAPClient:
+    ctx = ssl_context(cfg.proton_verify)
+    security = cfg.proton_security
+    if security == "auto":
+        # Proton Bridge serves implicit TLS or STARTTLS depending on its settings. A plain
+        # greeting read against a TLS-only port hangs, so try TLS first.
+        try:
+            client = open_connection(cfg.proton_host, cfg.proton_port, "ssl", ctx)
+            security = "ssl"
+        except (ssl.SSLError, OSError, IMAPClientError) as exc:
+            log.debug("implicit TLS to Bridge failed (%s); trying STARTTLS", exc)
+            client = open_connection(cfg.proton_host, cfg.proton_port, "starttls", ctx)
+            security = "starttls"
+    else:
+        client = open_connection(cfg.proton_host, cfg.proton_port, security, ctx)
+    log.debug("Bridge connection uses %s", security)
+    client.login(cfg.proton_user, cfg.proton_pass)
+    return client
+
+
+def connect_target(cfg: Config) -> IMAPClient:
+    client = open_connection(cfg.host, cfg.port, cfg.security, ssl_context(cfg.verify))
+    client.login(cfg.user, cfg.password)
+    return client
+
+
+def append_limit(client: IMAPClient) -> int:
+    """Largest message the server accepts, 0 when it does not say."""
+    for cap in client.capabilities():
+        if cap.upper().startswith(b"APPENDLIMIT="):
+            return int(cap.split(b"=", 1)[1])
+    return 0
+
+
+def decode_delim(delim) -> str:
+    return (delim.decode() if isinstance(delim, bytes) else delim) or "/"
+
+
+@dataclass
+class Folders:
+    """The target's folder list, resolved by SPECIAL-USE attribute and by name."""
+
+    special: dict[bytes, str]
+    by_lower: dict[str, str]  # lower-case name -> real name, every selectable folder
+    delim: str
+    prefix: str  # personal namespace prefix, "" or e.g. "INBOX."
+
+    def full(self, path: str) -> str:
+        """Folder name under the personal namespace."""
+        return path if path.upper() == "INBOX" else self.prefix + path
+
+
+def personal_prefix(client: IMAPClient, delim: str, names: list[str]) -> str:
+    if client.has_capability("NAMESPACE"):
+        with contextlib.suppress(Exception):  # some servers advertise it and then fail
+            personal = client.namespace().personal
+            if personal and personal[0][0]:
+                return personal[0][0]
+    # No usable NAMESPACE: infer an "INBOX." style prefix from the existing folders.
+    others = [n for n in names if n.upper() != "INBOX"]
+    if others and all(n.upper().startswith("INBOX" + delim) for n in others):
+        return others[0][: len("INBOX") + len(delim)]
+    return ""
+
+
+def list_target_folders(client: IMAPClient) -> Folders:
+    special: dict[bytes, str] = {}
+    by_lower: dict[str, str] = {}
+    delim = "/"
+    names: list[str] = []
+    listing = client.list_folders()
+    for _flags, d, name in listing:
+        delim = decode_delim(d)
+        names.append(name)
+    prefix = personal_prefix(client, delim, names)
+    for flags, _d, name in listing:
+        if b"\\Noselect" in flags:
+            continue
+        by_lower[name.lower()] = name
+        bare = name[len(prefix) :] if prefix and name.startswith(prefix) else name
+        kind = next((f for f in flags if f in SPECIAL_KINDS), None) or TARGET_NAME_KIND.get(bare.lower())
+        if kind:
+            special.setdefault(kind, name)
+    return Folders(special, by_lower, delim, prefix)
+
+
+class Session:
+    """Holds both connections and knows how to re-establish them mid-run."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.proton = connect_proton(cfg)
+        self.target = connect_target(cfg)
+        self.max_size = append_limit(self.target)
+        self.folders = list_target_folders(self.target)
+        self.proton_folder: str | None = None
+        self.target_folder: str | None = None
+
+    def refresh_folders(self) -> None:
+        self.folders = list_target_folders(self.target)
+
+    def select_proton(self, folder: str) -> dict:
+        self.proton_folder = folder
+        return self.proton.select_folder(folder, readonly=True)
+
+    def select_target(self, folder: str) -> dict:
+        self.target_folder = folder
+        return self.target.select_folder(folder, readonly=True)
+
+    def reconnect(self) -> None:
+        for client in (self.proton, self.target):
+            with contextlib.suppress(Exception):  # connection may already be broken
+                client.logout()
+        self.proton = connect_proton(self.cfg)
+        self.target = connect_target(self.cfg)
+        # System folder names can change between sessions; resolve them again.
+        self.refresh_folders()
+        if self.proton_folder:
+            self.proton.select_folder(self.proton_folder, readonly=True)
+        if self.target_folder:
+            self.target.select_folder(self.target_folder, readonly=True)
+
+    def close(self) -> None:
+        for client in (self.proton, self.target):
+            with contextlib.suppress(Exception):  # connection may already be broken
+                client.logout()
+
+    def call(self, side: str, method: str, *args):
+        """Call self.<side>.<method>(*args); reconnect once on a dropped connection; detect throttling."""
+        for attempt in (1, 2):
+            try:
+                return getattr(getattr(self, side), method)(*args)
+            except (IMAPClientAbortError, OSError, ssl.SSLError) as exc:
+                if attempt == 2:
+                    raise Fatal(f"connection lost and reconnect failed: {exc}") from exc
+                log.warning("connection dropped (%s); reconnecting", exc)
+                time.sleep(5)
+                self.reconnect()
+            except IMAPClientError as exc:
+                text = str(exc).upper()
+                if any(marker in text for marker in THROTTLE_MARKERS):
+                    raise Throttled(str(exc)) from exc
+                raise
+        return None  # unreachable
+
+
+# --------------------------------------------------------------------- folder mapping
+
+
+@dataclass
+class Target:
+    kind: bytes | None  # SPECIAL-USE kind, resolved to a name at use time; None for a custom folder
+    name: str  # full folder name (custom), or the system folder name seen at mapping time
+    create: bool = False  # folder does not exist on the target yet
+
+
+@dataclass
+class Mapping:
+    proton: str
+    target: Target | None  # None: skip this folder
+    note: str
+    is_label: bool = False  # Proton label rather than folder; processed last
+
+
+def target_folder(session: Session, target: Target) -> str:
+    if target.kind is None:
+        return target.name
+    name = session.folders.special.get(target.kind)
+    if name:
+        return name
+    if target.create:
+        return target.name  # created (or would be created) by this run
+    raise Fatal(f"target has no {target.kind.decode()} folder any more")
+
+
+def proton_kind(flags: tuple[bytes, ...], name: str) -> bytes | None:
+    if name.upper() == "INBOX":
+        return b"INBOX"
+    for flag in flags:
+        if flag in SPECIAL_KINDS:
+            return flag
+    return PROTON_NAME_KIND.get(name.lower())
+
+
+def rewrite_dots(part: str) -> str:
+    """Make one folder name segment safe for servers that cannot store a dot.
+
+    A dot before whitespace or at the end marks an abbreviation and is dropped
+    ("G. Blake" -> "G Blake"); any other dot sits inside a token and becomes an
+    underscore ("One.com" -> "One_com", "Ver 2.0" -> "Ver 2_0")."""
+    return re.sub(r"\.(?=\s|$)", "", part).replace(".", "_")
+
+
+def custom_folder_name(name: str, proton_delim: str, folders: Folders, keep_dots: bool = False) -> str:
+    parts = name.split(proton_delim) if proton_delim else [name]
+    if len(parts) > 1 and parts[0].lower() in BRIDGE_PREFIXES:
+        parts = parts[1:]
+    # Many servers use "." as the hierarchy separator, on the wire or on disk, and reject it
+    # in names. Where it is the delimiter the rewrite is not optional.
+    if not keep_dots or folders.delim == ".":
+        parts = [rewrite_dots(part) for part in parts]
+    # Servers reject names with leading, trailing or doubled whitespace; Proton allows them.
+    parts = [re.sub(r"\s+", " ", part).strip() for part in parts]
+    # A segment containing the target's own delimiter would be split into two levels.
+    parts = [part.replace(folders.delim, "-") for part in parts if part]
+    return folders.full(folders.delim.join(parts))
+
+
+def map_folders(session: Session, args: argparse.Namespace) -> list[Mapping]:
+    folders = session.folders
+    mappings: list[Mapping] = []
+    sources: dict[str, list[str]] = {}  # target folder (lower-case) -> Proton folders mapped to it
+    wanted = {f.lower() for f in args.folder} if args.folder else None
+    for flags, delim, name in session.proton.list_folders():
+        if b"\\Noselect" in flags:
+            continue
+        if wanted is not None and name.lower() not in wanted:
+            continue
+        proton_delim = decode_delim(delim)
+        kind = proton_kind(flags, name)
+        if kind == b"INBOX":
+            mappings.append(Mapping(name, Target(None, "INBOX"), "inbox"))
+        elif kind in (b"\\All", b"\\Flagged"):
+            mappings.append(Mapping(name, None, "virtual folder, skipped"))
+        elif kind == b"\\Trash" and not args.include_trash:
+            mappings.append(Mapping(name, None, "skipped (use --include-trash)"))
+        elif kind == b"\\Junk" and not args.include_spam:
+            mappings.append(Mapping(name, None, "skipped (use --include-spam)"))
+        elif kind in (b"\\Sent", b"\\Drafts", b"\\Archive", b"\\Trash", b"\\Junk"):
+            folder = folders.special.get(kind)
+            if folder:
+                mappings.append(Mapping(name, Target(kind, folder), "system folder"))
+            else:
+                folder = folders.full(DEFAULT_SYSTEM_NAME[kind])
+                mappings.append(Mapping(name, Target(kind, folder, create=True), "system folder, missing on target"))
+        else:
+            is_label = name.split(proton_delim, 1)[0].lower() == "labels"
+            folder = custom_folder_name(name, proton_delim, folders, args.keep_dots)
+            existing = folders.by_lower.get(folder.lower())
+            what = "label" if is_label else "folder"
+            custom_part = name.split(proton_delim, 1)[-1]  # without the Bridge's Folders/ or Labels/
+            if "." in custom_part and (not args.keep_dots or folders.delim == "."):
+                what += ", dots rewritten"
+            sources.setdefault(folder.lower(), []).append(name)
+            if existing:
+                mappings.append(Mapping(name, Target(None, existing), f"existing folder ({what})", is_label))
+            else:
+                mappings.append(Mapping(name, Target(None, folder, create=True), f"new folder ({what})", is_label))
+    if wanted is not None:
+        found = {m.proton.lower() for m in mappings}
+        for missing in wanted - found:
+            log.warning("Proton folder %r not found", missing)
+    for names in sources.values():
+        if len(names) > 1:
+            log.warning("Proton folders %s map to the same target folder; their mail will share it", ", ".join(map(repr, names)))
+    # A message lives in one Proton folder and may carry several labels. Process folders
+    # first so the copy lands in the folder; labels then only catch messages found nowhere else.
+    mappings.sort(key=lambda m: m.is_label)
+    return mappings
+
+
+def create_folders(session: Session, mappings: list[Mapping], dry_run: bool) -> None:
+    folders = session.folders
+    created: set[str] = set()
+    for m in mappings:
+        if not m.target or not m.target.create:
+            continue
+        # Create parents first. The namespace prefix is not itself a folder to create.
+        bare = m.target.name[len(folders.prefix) :] if folders.prefix and m.target.name.startswith(folders.prefix) else m.target.name
+        parts = bare.split(folders.delim)
+        for i in range(1, len(parts) + 1):
+            path = folders.full(folders.delim.join(parts[:i]))
+            if path in created or path.lower() in folders.by_lower:
+                continue
+            created.add(path)
+            if dry_run:
+                log.info("would create folder %r", path)
+            else:
+                log.info("creating folder %r", path)
+                session.call("target", "create_folder", path)
+                folders.by_lower[path.lower()] = path
+    if created and not dry_run:
+        session.refresh_folders()  # so newly created system folders resolve by kind
+
+
+# ---------------------------------------------------------------------- message keys
+
+
+@dataclass
+class KeyInfo:
+    key: str
+    subject: str = ""
+
+
+_parser = BytesHeaderParser(policy=email.policy.default)
+
+
+def header_block(data: dict) -> bytes:
+    for k, v in data.items():
+        if isinstance(k, bytes) and k.startswith(b"BODY[HEADER"):
+            return v or b""
+    return b""
+
+
+def _header(msg, name: str) -> str:
+    try:
+        value = msg.get(name)
+        return str(value) if value is not None else ""
+    except Exception:  # noqa: BLE001 - malformed header
+        return ""
+
+
+def message_key(raw: bytes, internaldate: datetime | None) -> KeyInfo:
+    msg = _parser.parsebytes(raw)
+    subject = re.sub(r"\s+", " ", _header(msg, "Subject")).strip()
+    mid = re.sub(r"\s+", "", _header(msg, "Message-ID")).strip("<>").lower()
+    if mid:
+        return KeyInfo(key="mid:" + mid, subject=subject)
+    date = None
+    try:
+        date = email.utils.parsedate_to_datetime(_header(msg, "Date"))
+    except Exception:  # noqa: BLE001
+        date = None
+    if date is None:
+        date = internaldate
+    if date is not None and date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    epoch = int(date.timestamp()) if date else 0
+    sender = email.utils.parseaddr(_header(msg, "From"))[1].lower()
+    return KeyInfo(key=f"hdr:{epoch}|{sender}|{subject}", subject=subject)
+
+
+# ---------------------------------------------------------------------- target index
+
+
+def chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def build_target_index(session: Session) -> dict[str, str]:
+    """key -> target folder holding the message, over every selectable folder."""
+    index: dict[str, str] = {}
+    for folder in sorted(session.folders.by_lower.values()):
+        session.select_target(folder)
+        uids = session.call("target", "search", "ALL")
+        log.info("indexing target %s: %d messages", folder, len(uids))
+        done = 0
+        for chunk in chunks(uids, CHUNK):
+            resp = session.call("target", "fetch", chunk, [HEADER_ITEM, "INTERNALDATE"])
+            for data in resp.values():
+                info = message_key(header_block(data), data.get(b"INTERNALDATE"))
+                index.setdefault(info.key, folder)
+            done += len(chunk)
+            log.debug("  indexed %d/%d", done, len(uids))
+    return index
+
+
+# --------------------------------------------------------------------------- state
+
+
+class State:
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = {"proton_uidvalidity": {}, "done": {}}
+        self.done: dict[str, set[int]] = {}
+        self.dirty = 0
+        if path.exists():
+            with path.open() as fh:
+                self.data = json.load(fh)
+            self.done = {k: set(v) for k, v in self.data.get("done", {}).items()}
+
+    def check_uidvalidity(self, folder: str, uidvalidity: int) -> None:
+        stored = self.data["proton_uidvalidity"].get(folder)
+        if stored is not None and stored != uidvalidity:
+            log.warning("UIDVALIDITY changed for %s; dropping resume data for it", folder)
+            self.done.pop(folder, None)
+        self.data["proton_uidvalidity"][folder] = uidvalidity
+
+    def is_done(self, folder: str, uid: int) -> bool:
+        return uid in self.done.get(folder, ())
+
+    def mark(self, folder: str, uid: int) -> None:
+        self.done.setdefault(folder, set()).add(uid)
+        self.dirty += 1
+        if self.dirty >= FLUSH_EVERY:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.dirty:
+            return
+        self.data["done"] = {k: sorted(v) for k, v in self.done.items()}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        with tmp.open("w") as fh:
+            json.dump(self.data, fh)
+        tmp.replace(self.path)
+        self.dirty = 0
+
+
+# ------------------------------------------------------------------------- transfer
+
+
+def translate_flags(flags) -> tuple[str, ...]:
+    return tuple(f.decode() for f in flags or () if f in KEEP_FLAGS)
+
+
+def crlf(raw: bytes) -> bytes:
+    return raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+
+def migrate_folder(session: Session, m: Mapping, index: dict[str, str], state: State, dry_run: bool) -> Counter:
+    target = m.target
+    assert target is not None
+    counts: Counter = Counter()
+    selected = session.select_proton(m.proton)
+    state.check_uidvalidity(m.proton, int(selected[b"UIDVALIDITY"]))
+    uids = session.call("proton", "search", "ALL")
+    todo = [u for u in uids if not state.is_done(m.proton, u)]
+    counts["resumed"] = len(uids) - len(todo)
+    dest = target_folder(session, target)
+    log.info("%s -> %s: %d messages, %d to check", m.proton, dest, len(uids), len(todo))
+
+    for chunk in chunks(todo, CHUNK):
+        resp = session.call("proton", "fetch", chunk, ["FLAGS", "INTERNALDATE", "RFC822.SIZE", HEADER_ITEM])
+        for uid in chunk:
+            data = resp.get(uid)
+            if not data:
+                counts["vanished"] += 1
+                continue
+            info = message_key(header_block(data), data.get(b"INTERNALDATE"))
+            where = index.get(info.key)
+            if where is not None:
+                counts["present"] += 1
+                if where.lower() != dest.lower():
+                    counts["elsewhere"] += 1
+                    log.debug("uid %d already in target %s, not copied to %s", uid, where, dest)
+            else:
+                size = int(data.get(b"RFC822.SIZE", 0))
+                if session.max_size and size > session.max_size:
+                    counts["too_large"] += 1
+                    log.warning("uid %d skipped: %d bytes exceeds the target's %d byte limit (%s)", uid, size, session.max_size, info.subject)
+                    continue
+                if not dry_run:
+                    body = session.call("proton", "fetch", [uid], ["BODY.PEEK[]"])[uid][b"BODY[]"]
+                    dest = target_folder(session, target)  # may have changed after a reconnect
+                    try:
+                        session.call(
+                            "target",
+                            "append",
+                            dest,
+                            crlf(body),
+                            translate_flags(data.get(b"FLAGS")),
+                            data.get(b"INTERNALDATE"),
+                        )
+                    except IMAPClientError as exc:
+                        counts["failed"] += 1
+                        log.warning("uid %d not copied (%s): %s", uid, info.subject, exc)
+                        continue
+                    log.debug("uid %d appended to %s (%s)", uid, dest, info.subject or info.key)
+                index[info.key] = dest
+                counts["appended"] += 1
+            if not dry_run:
+                state.mark(m.proton, uid)
+    return counts
+
+
+def report(m: Mapping, counts: Counter, dry_run: bool) -> None:
+    verb = "would append" if dry_run else "appended"
+    parts = [f"{counts['appended']} {verb}", f"{counts['present']} already present"]
+    for key, text in (
+        ("elsewhere", "of those in another folder"),
+        ("resumed", "done earlier"),
+        ("too_large", "too large"),
+        ("failed", "failed"),
+        ("vanished", "vanished"),
+    ):
+        if counts[key]:
+            parts.append(f"{counts[key]} {text}")
+    print(f"{m.proton} -> {m.target.name if m.target else '-'}: " + ", ".join(parts))
+
+
+# ----------------------------------------------------------------------------- main
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="proton2imap",
+        description="Copy mail from Proton Mail (via Proton Bridge IMAP) into any IMAP account, "
+        "mapping folders to folders and skipping messages the target already has.",
+        epilog=__doc__[__doc__.index("Credentials") :] if __doc__ else None,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--dry-run", action="store_true", help="show the folder mapping and counts, change nothing")
+    p.add_argument("--folder", action="append", default=[], metavar="NAME", help="only this Proton folder (repeatable)")
+    p.add_argument("--include-trash", action="store_true", help="also migrate Proton Trash into the target's Trash")
+    p.add_argument("--include-spam", action="store_true", help="also migrate Proton Spam into the target's Junk")
+    p.add_argument(
+        "--keep-dots",
+        action="store_true",
+        help='keep "." in folder names (only for servers that accept it; ignored when "." is the hierarchy delimiter)',
+    )
+    p.add_argument(
+        "--state",
+        type=Path,
+        default=Path.home() / ".cache" / "proton2imap" / "state.json",
+        metavar="FILE",
+        help="resume state file (default: %(default)s)",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="log every message")
+    return p.parse_args(argv)
+
+
+def run(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    try:
+        session = Session(cfg)
+    except (IMAPClientError, OSError, ssl.SSLError) as exc:
+        raise Fatal(f"cannot connect: {exc}") from exc
+    state = State(args.state)
+    totals: Counter = Counter()
+    status = 0
+    try:
+        f = session.folders
+        log.info("target %s: delimiter %r, namespace prefix %r", cfg.host, f.delim, f.prefix)
+        mappings = map_folders(session, args)
+        print("Folder mapping:")
+        for m in mappings:
+            dest = m.target.name if m.target else "(skip)"
+            print(f"  {m.proton:40} -> {dest:40} {m.note}")
+        create_folders(session, mappings, args.dry_run)
+
+        index = build_target_index(session)
+        log.info("target index: %d distinct messages", len(index))
+
+        for m in mappings:
+            if not m.target:
+                continue
+            counts = migrate_folder(session, m, index, state, args.dry_run)
+            report(m, counts, args.dry_run)
+            totals.update(counts)
+    except Throttled as exc:
+        log.error("the target is throttling this account: %s", exc)
+        log.error("re-run later; progress has been saved to %s", args.state)
+        status = 3
+    except KeyboardInterrupt:
+        log.warning("interrupted; progress saved to %s", args.state)
+        status = 130
+    finally:
+        state.flush()
+        session.close()
+    verb = "would append" if args.dry_run else "appended"
+    print(f"Total: {totals['appended']} {verb}, {totals['present']} already present, {totals['failed']} failed")
+    return status
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    sys.stdout.reconfigure(line_buffering=True)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
+    log.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    try:
+        return run(args)
+    except Fatal as exc:
+        log.error("%s", exc)
+        return 2 if "connect" in str(exc) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
