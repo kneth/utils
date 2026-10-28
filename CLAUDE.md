@@ -17,14 +17,18 @@ Python script; a Python script beats a node script unless the task is JS-native.
 
 ## Repository layout
 
-Scripts live as flat executable files at the top level, one directory per multi-file
-tool if ever needed. There is no build system, package manager or shared test harness;
-do not scaffold one for a single script.
+Scripts are grouped by purpose into one top-level directory per group of utilities
+(e.g. `mail/`); each script is a flat executable file inside its group's directory.
+Put a new script in the matching group, or create a new group directory for it; do not
+add scripts at the top level. There is no build system, package manager or shared test
+harness; do not scaffold one for a single script.
+
+### `mail/` — mail migration
 
 - `proton2gmail` — Python, migrates Proton Mail (via Proton Bridge IMAP) to Gmail
   IMAP, deduplicating on Message-ID and resuming from `~/.cache/proton2gmail/state.json`.
-  Run: `./proton2gmail --help` (shebang uses `uv run --script`; credentials via env
-  vars listed in the help). Lint: `uvx ruff check --line-length 130 proton2gmail`.
+  Run: `mail/proton2gmail --help` (shebang uses `uv run --script`; credentials via env
+  vars listed in the help). Lint: `uvx ruff check --line-length 130 mail/proton2gmail`.
   Test offline by mocking `connect_proton`/`connect_gmail` with a fake IMAPClient.
   Gmail system folder names are localised and change with the account language, so
   targets carry the SPECIAL-USE attribute and names are resolved at use time, re-read
