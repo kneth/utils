@@ -60,7 +60,13 @@ harness; do not scaffold one for a single script.
   skipped; All Mail goes to iCloud Archive, processed last so it only gets mail found
   nowhere else (`--skip-all-mail` opts out). State is per source account in
   `~/.cache/imap2icloud/USER@HOST.json`.
-  Keep the four scripts' shared sections (connection, keys, state, transfer) in step
+- `icloud2imap` — Python, the reverse of `imap2icloud`: iCloud (`ICLOUD_IMAP_USER`/
+  `ICLOUD_IMAP_PASS`) as the source, any IMAP server as the target, with `proton2imap`'s
+  `IMAP_*` variables, namespace and delimiter handling, and dot rewriting (`--keep-dots`).
+  Each message is copied once across the target. State is per account pair in
+  `~/.cache/icloud2imap/ICLOUD_USER--USER@HOST.json`, since the UIDs marked done only
+  hold for that target.
+  Keep the five scripts' shared sections (connection, keys, state, transfer) in step
   when fixing one of them.
 
 ## Host toolchain (verified on this machine, macOS arm64)
