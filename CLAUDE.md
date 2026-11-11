@@ -25,48 +25,19 @@ harness; do not scaffold one for a single script.
 
 ### `mail/` — mail migration
 
-- `proton2gmail` — Python, migrates Proton Mail (via Proton Bridge IMAP) to Gmail
-  IMAP, deduplicating on Message-ID and resuming from `~/.cache/proton2gmail/state.json`.
-  Run: `mail/proton2gmail --help` (shebang uses `uv run --script`; credentials via env
-  vars listed in the help). Lint: `uvx ruff check --line-length 130 mail/proton2gmail`.
-  Test offline by mocking `connect_proton`/`connect_gmail` with a fake IMAPClient.
-  Gmail system folder names are localised and change with the account language, so
+Five Python IMAP migration scripts (`proton2gmail`, `proton2icloud`, `proton2imap`,
+`imap2icloud`, `icloud2imap`). What they do, their options and environment variables are
+documented in `README.md`; keep it in step when changing behaviour or options.
+
+- Lint: `uvx ruff check --line-length 130 mail/<script>`.
+- Test offline by mocking the `connect_*` functions with a fake IMAPClient.
+- System folder names are localised (Gmail's change with the account language), so
   targets carry the SPECIAL-USE attribute and names are resolved at use time, re-read
   after a reconnect or a NONEXISTENT response.
-  imapclient 3.1 breaks on Python 3.14 (imaplib made `file` a property), and
-  `~/.python-version` pins uv to 3.14, so the script's shebang and PEP 723 header
-  both pin `>=3.11,<3.14`. Keep that until imapclient ships a fix.
-- `proton2icloud` — Python, same shape as `proton2gmail` but for iCloud Mail
-  (`imap.mail.me.com`, app-specific password via `ICLOUD_IMAP_USER`/`ICLOUD_IMAP_PASS`).
-  iCloud has no labels or All Mail, so the dedup index spans every iCloud folder, each
-  message is copied once, and Proton labels are processed after folders. System folder
-  names are re-resolved by SPECIAL-USE attribute after every reconnect. Same run, lint
-  and test approach as `proton2gmail`; state in `~/.cache/proton2icloud/state.json`.
-- `proton2imap` — Python, `proton2icloud` generalised to any IMAP server. Target via
-  `IMAP_HOST`/`IMAP_PORT`/`IMAP_USER`/`IMAP_PASS`/`IMAP_SECURITY` (ssl, starttls, none)
-  and `IMAP_NOVERIFY`. Honours the server's hierarchy delimiter and personal namespace
-  prefix (NAMESPACE, or inferred `INBOX.`), replaces the delimiter inside folder names,
-  finds system folders by SPECIAL-USE with a table of common names as fallback, and
-  creates a missing one under a default name. Dots in folder names are rewritten by
-  default because many servers cannot store them: dropped before a space or at the end
-  (`G. Blake` to `G Blake`), otherwise replaced by `_` (`One.com` to `One_com`);
-  `--keep-dots` opts out except where `.` is the delimiter. State in
-  `~/.cache/proton2imap/state.json`.
-- `imap2icloud` — Python, `proton2icloud` with any IMAP server as the source. Source via
-  `SOURCE_IMAP_HOST`/`SOURCE_IMAP_PORT`/`SOURCE_IMAP_USER`/`SOURCE_IMAP_PASS`/
-  `SOURCE_IMAP_SECURITY` (ssl, starttls, none) and `SOURCE_IMAP_NOVERIFY`. Strips the
-  source's namespace prefix and translates its delimiter; source system folders found by
-  SPECIAL-USE or a common-name table (incl. Gmail `[Gmail]/...`). Starred/Important are
-  skipped; All Mail goes to iCloud Archive, processed last so it only gets mail found
-  nowhere else (`--skip-all-mail` opts out). State is per source account in
-  `~/.cache/imap2icloud/USER@HOST.json`.
-- `icloud2imap` — Python, the reverse of `imap2icloud`: iCloud (`ICLOUD_IMAP_USER`/
-  `ICLOUD_IMAP_PASS`) as the source, any IMAP server as the target, with `proton2imap`'s
-  `IMAP_*` variables, namespace and delimiter handling, and dot rewriting (`--keep-dots`).
-  Each message is copied once across the target. State is per account pair in
-  `~/.cache/icloud2imap/ICLOUD_USER--USER@HOST.json`, since the UIDs marked done only
-  hold for that target.
-  Keep the five scripts' shared sections (connection, keys, state, transfer) in step
+- imapclient 3.1 breaks on Python 3.14 (imaplib made `file` a property), and
+  `~/.python-version` pins uv to 3.14, so each shebang and PEP 723 header pins
+  `>=3.11,<3.14`. Keep that until imapclient ships a fix.
+- Keep the five scripts' shared sections (connection, keys, state, transfer) in step
   when fixing one of them.
 
 ## Host toolchain (verified on this machine, macOS arm64)
@@ -92,6 +63,7 @@ Assume scripts run on this Mac unless told otherwise.
 ## Script conventions
 
 - Every script takes `-h`/`--help` and prints a one-paragraph usage.
+- Every script is documented for users in `README.md`, under its group's section.
 - Shell scripts start with `set -euo pipefail` and quote all expansions.
 - Scripts are executable (`chmod +x`) and named without an extension when they are
   meant to be called from PATH; keep the extension for library-style files.
